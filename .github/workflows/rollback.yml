@@ -1,0 +1,88 @@
+# Recuperación de una versión anterior (rollback) ejecutada a mano desde la pestaña Actions.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      entorno:
+        description: Entorno a revertir
+        type: choice
+        options: [staging, demo]
+        default: demo
+      version:
+        description: Versión (SHA corto de 7 caracteres) a restaurar. Vacío = la versión desplegada antes de la actual.
+        type: string
+        required: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STACK_NAME: ${{ vars.STACK_NAME || 'cicd-demo' }}
+
+jobs:
+  rollback:
+    name: Restaurar versión en ${{ inputs.entorno }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.entorno }}
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Elegir la versión a restaurar
+        id: elegir
+        env:
+          ENTORNO: ${{ inputs.entorno }}
+          VERSION_PEDIDA: ${{ inputs.version }}
+        run: |
+          REPO="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" --output text)"
+
+          if [ -n "$VERSION_PEDIDA" ]; then
+            VERSION="$VERSION_PEDIDA"
+          else
+            # Recorre las revisiones de la definición de tarea (más reciente primero) y toma
+            # la primera cuya imagen sea distinta de la que corre ahora.
+            FAMILIA="$STACK_NAME-$ENTORNO"
+            ACTUAL=""
+            VERSION=""
+            for TD in $(aws ecs list-task-definitions --family-prefix "$FAMILIA" --sort DESC \
+                          --query 'taskDefinitionArns' --output text); do
+              IMG="$(aws ecs describe-task-definition --task-definition "$TD" \
+                       --query 'taskDefinition.containerDefinitions[0].image' --output text)"
+              case "$IMG" in *:*) TAG="${IMG##*:}" ;; *) continue ;; esac
+              [ "$IMG" = "${IMG#"$REPO"}" ] && continue   # ignora la imagen temporal inicial
+              if [ -z "$ACTUAL" ]; then ACTUAL="$TAG"; continue; fi
+              if [ "$TAG" != "$ACTUAL" ]; then VERSION="$TAG"; break; fi
+            done
+            if [ -z "$VERSION" ]; then
+              echo "::error::No hay una versión anterior registrada en $ENTORNO"; exit 1
+            fi
+          fi
+
+          # Verifica que la imagen exista en ECR antes de desplegarla.
+          aws ecr describe-images --repository-name "${REPO##*/}" --image-ids imageTag="$VERSION" >/dev/null \
+            || { echo "::error::La versión $VERSION no existe en ECR"; exit 1; }
+
+          echo "Versión a restaurar: $VERSION"
+          echo "image=$REPO:$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Desplegar la versión anterior
+        id: deploy
+        run: bash scripts/deploy-ecs.sh "${{ inputs.entorno }}" "${{ steps.elegir.outputs.image }}" "${{ steps.elegir.outputs.version }}"
+
+      - name: Prueba de humo
+        run: bash scripts/smoke-test.sh "${{ steps.deploy.outputs.url }}" "${{ steps.elegir.outputs.version }}"
+
+      - name: Resumen
+        run: |
+          echo "## Rollback en ${{ inputs.entorno }} a \`${{ steps.elegir.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ejecutado por: @${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"

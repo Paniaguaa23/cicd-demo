@@ -1,0 +1,131 @@
+# Entrega continua: al integrar en main se construye UNA imagen, se despliega en staging,
+# se valida y, tras la aprobación manual, se promueve la MISMA imagen al entorno demo.
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: despliegue
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STACK_NAME: ${{ vars.STACK_NAME || 'cicd-demo' }}
+
+jobs:
+  ci:
+    name: Integración continua
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Construir y publicar imagen en ECR
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # necesario para OIDC
+      contents: read
+    outputs:
+      image: ${{ steps.imagen.outputs.image }}
+      version: ${{ steps.imagen.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Credenciales temporales de AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Iniciar sesión en Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construir y subir la imagen
+        id: imagen
+        run: |
+          VERSION="${GITHUB_SHA::7}"
+          REPO="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" --output text)"
+          IMAGE="$REPO:$VERSION"
+
+          # Las etiquetas son inmutables: si la versión ya existe (re-ejecución), se reutiliza.
+          if aws ecr describe-images --repository-name "${REPO##*/}" --image-ids imageTag="$VERSION" >/dev/null 2>&1; then
+            echo "La imagen $IMAGE ya existe; se reutiliza."
+          else
+            docker build \
+              --build-arg APP_VERSION="$VERSION" \
+              --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              -t "$IMAGE" .
+            docker push "$IMAGE"
+          fi
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Imagen publicada"
+            echo "\`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-staging:
+    name: Desplegar en staging
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Desplegar en ECS (staging)
+        id: deploy
+        run: bash scripts/deploy-ecs.sh staging "${{ needs.build.outputs.image }}" "${{ needs.build.outputs.version }}"
+
+      - name: Prueba de humo en staging
+        run: bash scripts/smoke-test.sh "${{ steps.deploy.outputs.url }}" "${{ needs.build.outputs.version }}"
+
+      - name: Resumen
+        run: |
+          echo "## Staging actualizado a \`${{ needs.build.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "URL: ${{ steps.deploy.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-demo:
+    name: Promover a demo
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    # El entorno "demo" tiene revisores obligatorios: GitHub pausa aquí hasta la aprobación.
+    environment:
+      name: demo
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Desplegar en ECS (demo)
+        id: deploy
+        run: bash scripts/deploy-ecs.sh demo "${{ needs.build.outputs.image }}" "${{ needs.build.outputs.version }}"
+
+      - name: Prueba de humo en demo
+        run: bash scripts/smoke-test.sh "${{ steps.deploy.outputs.url }}" "${{ needs.build.outputs.version }}"
+
+      - name: Resumen
+        run: |
+          echo "## Demo promovido a \`${{ needs.build.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "URL: ${{ steps.deploy.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"

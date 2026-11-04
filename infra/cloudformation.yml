@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Infraestructura para la demo CI/CD (UNICAES - Tema 5). Crea VPC, ECR, cluster ECS Fargate
+  con dos servicios (staging y demo) detrás de un ALB, logs en CloudWatch y un rol IAM
+  que GitHub Actions asume con OIDC (sin llaves de acceso guardadas).
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: Usuario u organización de GitHub dueña del repositorio (ej. inge-unicaes)
+  GitHubRepo:
+    Type: String
+    Description: Nombre del repositorio (ej. cicd-demo)
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Use 'false' si la cuenta ya tiene el proveedor OIDC token.actions.githubusercontent.com
+  ProjectName:
+    Type: String
+    Default: cicd-demo
+
+Conditions:
+  CrearOidc: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  # ---------------- Red ----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpc' }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-a' }]
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-b' }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable }
+
+  SubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable }
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Acceso HTTP publico al balanceador (80 demo, 8080 staging)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Los contenedores solo aceptan trafico desde el ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+
+  # ---------------- Registro de imagenes ----------------
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Conservar las 15 imagenes mas recientes",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":15},
+          "action":{"type":"expire"}}]}
+
+  # ---------------- Balanceador ----------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroupStaging:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-staging'
+      VpcId: !Ref Vpc
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+
+  TargetGroupDemo:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-demo'
+      VpcId: !Ref Vpc
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+
+  ListenerDemo:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroupDemo }]
+
+  ListenerStaging:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroupStaging }]
+
+  # ---------------- ECS ----------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      ClusterSettings: [{ Name: containerInsights, Value: enabled }]
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: 7
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # Definiciones iniciales: imagen publica de Node con un servidor minimo en /health.
+  # El pipeline las reemplaza en el primer despliegue con la imagen real de ECR.
+  TaskDefinitionStaging:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-staging'
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: public.ecr.aws/docker/library/node:22-alpine
+          Command: ['node', '-e', "require('http').createServer((q,s)=>s.end('placeholder')).listen(3000)"]
+          PortMappings: [{ ContainerPort: 3000 }]
+          Environment: [{ Name: APP_ENV, Value: staging }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: staging
+
+  TaskDefinitionDemo:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-demo'
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: public.ecr.aws/docker/library/node:22-alpine
+          Command: ['node', '-e', "require('http').createServer((q,s)=>s.end('placeholder')).listen(3000)"]
+          PortMappings: [{ ContainerPort: 3000 }]
+          Environment: [{ Name: APP_ENV, Value: demo }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: demo
+
+  ServiceStaging:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerStaging
+    Properties:
+      ServiceName: !Sub '${ProjectName}-staging'
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinitionStaging
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: 3000, TargetGroupArn: !Ref TargetGroupStaging }
+
+  ServiceDemo:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerDemo
+    Properties:
+      ServiceName: !Sub '${ProjectName}-demo'
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinitionDemo
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: 3000, TargetGroupArn: !Ref TargetGroupDemo }
+
+  # ---------------- Credenciales seguras: OIDC ----------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CrearOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-github-deploy'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CrearOidc
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Solo la rama main y los entornos protegidos de ESTE repositorio pueden asumir el rol.
+                # Se aceptan los dos formatos del claim "sub": el clásico y el que incluye IDs
+                # (repositorios creados después del 15-jul-2026: repo:org@123/repo@456:...).
+                token.actions.githubusercontent.com:sub:
+                  - !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main'
+                  - !Sub 'repo:${GitHubOrg}/${GitHubRepo}:environment:staging'
+                  - !Sub 'repo:${GitHubOrg}/${GitHubRepo}:environment:demo'
+                  - !Sub 'repo:${GitHubOrg}@*/${GitHubRepo}@*:ref:refs/heads/main'
+                  - !Sub 'repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:staging'
+                  - !Sub 'repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:demo'
+      Policies:
+        - PolicyName: despliegue-minimo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LoginECR
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: PushPullImagenes
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+              - Sid: DefinicionesDeTarea
+                Effect: Allow
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                  - ecs:ListTaskDefinitions
+                Resource: '*'
+              - Sid: ActualizarServicios
+                Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                Resource:
+                  - !Ref ServiceStaging
+                  - !Ref ServiceDemo
+              - Sid: PasarRolDeEjecucion
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt TaskExecutionRole.Arn
+              - Sid: LeerSalidasDelStack
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
+
+Outputs:
+  EcrRepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  ClusterName:
+    Value: !Ref Cluster
+  StagingServiceName:
+    Value: !GetAtt ServiceStaging.Name
+  DemoServiceName:
+    Value: !GetAtt ServiceDemo.Name
+  StagingUrl:
+    Value: !Sub 'http://${LoadBalancer.DNSName}:8080'
+  DemoUrl:
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+  GitHubDeployRoleArn:
+    Description: Copiar este valor al secreto AWS_ROLE_ARN del repositorio
+    Value: !GetAtt GitHubDeployRole.Arn

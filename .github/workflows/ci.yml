@@ -1,0 +1,58 @@
+# Integración continua: se ejecuta en cada push a ramas de trabajo y en cada Pull Request.
+# También la reutiliza el pipeline de despliegue (workflow_call).
+name: CI
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Lint, pruebas y build de imagen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Análisis estático (ESLint)
+        run: npm run lint
+
+      - name: Pruebas automáticas (Jest)
+        run: npm test
+
+      - name: Guardar reporte de cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobertura-${{ github.sha }}
+          path: coverage/
+          retention-days: 14
+
+      - name: Verificar que la imagen Docker construye
+        run: docker build -t cicd-demo:ci .
+
+      - name: Resumen de la ejecución
+        if: always()
+        run: |
+          COBERTURA=$(jq -r '.total.lines.pct' coverage/coverage-summary.json 2>/dev/null || echo "n/d")
+          {
+            echo "## Resultado de CI"
+            echo "| Dato | Valor |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+            echo "| Rama | \`${GITHUB_REF_NAME}\` |"
+            echo "| Cobertura de líneas | ${COBERTURA}% |"
+          } >> "$GITHUB_STEP_SUMMARY"
