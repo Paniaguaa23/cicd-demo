@@ -27,7 +27,7 @@ function crearApp() {
   app.use(express.json());
 
   app.get('/health', (_req, res) => {
-    res.json({ estado: 'ok', version: APP_VERSION });
+    res.status(500).json({ estado: 'ok', version: APP_VERSION });
   });
 
   app.get('/api/info', (_req, res) => {
