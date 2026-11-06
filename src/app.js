@@ -8,7 +8,7 @@ const APP_ENV = process.env.APP_ENV || 'desarrollo';
 const BUILD_TIME = process.env.BUILD_TIME || new Date().toISOString();
 
 // Cambiar este mensaje (y hacer push) es la demostración práctica.
-const MENSAJE = 'Cambio de ejemplo 01';
+const MENSAJE = 'Prueba en clase';
 
 // Lista de tareas en memoria: suficiente para probar una API real.
 const tareas = [
